@@ -1,0 +1,7 @@
+movement @ ../movement
+transformers 
+torch 
+torchvision 
+numpy 
+xarray 
+opencv-python 
