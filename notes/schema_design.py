@@ -1,4 +1,4 @@
-# notes/memory_analysis.py
+# notes/schema_design.py
 # Thinking through mask storage options before committing to a schema.
 # The core problem: full binary masks are huge. I want to understand
 # exactly how much is saved by each alternative so I can justify the
