@@ -1,4 +1,5 @@
 # notes/sam2_format_study.py
+# SAM2 output format study — simulates video_segments[frame_idx][obj_id] structure
 # I want to understand the SAM2 output format before writing any loader code.
 # No GPU needed here — just figuring out the data structure and what I'll
 # actually be parsing.
