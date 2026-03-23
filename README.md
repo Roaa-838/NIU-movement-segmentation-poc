@@ -1,120 +1,143 @@
-# Movement Segmentation PoC
-GSoC 2026 — NIU Movement: Segmentation Tracking ([issue #301](https://github.com/neuroinformatics-unit/movement/issues/301))
+# NIU Movement — Segmentation Tracking PoC
 
-## Goal
-Demonstrate that SAM2 segmentation output can be converted into a
-movement-compatible `xarray.Dataset`, and that existing movement kinematics
-functions work on it without modification.
+This is my proof-of-concept for the GSoC 2026 project
+[Movement: Support for Segmentation Mask Tracking (Issue #301)](https://github.com/neuroinformatics-unit/movement/issues/301).
 
-## Status
-- [x] movement installed and test suite passing (1126 passed, 100% coverage)
-- [x] Memory analysis: full masks vs RLE vs contours (`notes/schema_design.py`)
-- [x] SAM2 output format studied and simulated (`notes/sam2_format_study.py`)
-- [x] xarray Dataset assembled and verified (`notes/build_xarray_dataset.py`)
-- [x] Compatibility confirmed: `compute_velocity`, `filter_by_confidence`, `compute_path_length`
-- [x] Loader mapping: `load_bboxes.py` → `load_segmentation.py` (`notes/loader_mapping.md`)
-- [x] Issue #301 thread annotated with technical position (`notes/issue_301_notes.md`)
-- [ ] OCTRON format study (Day 4)
-- [ ] Skeleton PR to movement (Day 4)
+The goal of the project is to let the [movement](https://github.com/neuroinformatics-unit/movement)
+library load tracked segmentation data from tools like
+[OCTRON](https://octron-tracking.github.io/OCTRON-docs/) alongside the
+kinematics analysis it already supports.
 
-## Proposed Dataset Schema
+---
 
-```
-<xarray.Dataset>
-Dimensions:
-    time:           n_frames
-    space:          2
-    individuals:    n_individuals
-    contour_points: max_contour_points   ← only present for SAM2/YOLO datasets
+## What this repo shows
 
-Coordinates:
-  * time         (time)         float64   seconds (if fps known) else frame index
-  * space        (space)        <U1       'x' 'y'
-  * individuals  (individuals)  object    'id_0' 'id_1' ...
+I built a loader for OCTRON's prediction output and verified it works end-to-end
+on Horst's real worm tracking data (`worm_detailed_BotSort`, 842 frames, 1000×1000px, fps=7).
 
-Data variables:
-    position     (time, space, individuals)                  float32  ← centroid
-    shape        (time, space, individuals)                  float32  ← bbox w,h
-    confidence   (time, individuals)                         float32  ← tracking score
-    contours     (time, individuals, contour_points, space)  float32  ← NaN-padded
-                 ↑ optional — only present for SAM2/YOLO, not OCTRON
+**Memory:** loading the CSV schema into an `xr.Dataset` uses **0.037 MB** of RAM.
+Eager-loading all four mask arrays from zarr would use **3,368 MB**.
+That's a **90,772× difference** — and the CSV centroid coordinates are
+mathematically exact (OCTRON computes them directly from blob detection, not derived).
 
-Attributes:
-    source_software:     'SAM2' | 'OCTRON'
-    source_file:         '/path/to/file'
-    fps:                 30.0
-    ds_type:             'segmentation'
-    original_resolution: [H, W]
-    rle_masks:           <optional, for mask reconstruction, SAM2/YOLO only>
-```
+**Kinematics compatibility:** `compute_velocity`, `compute_path_length`, and
+`filter_by_confidence` from movement all work on the dataset with zero changes
+to existing functions.
 
-`position` and `shape` use `(time, space, individuals)` — identical to the
-existing bboxes dataset. This means `compute_velocity`, `filter_by_confidence`,
-and `compute_path_length` all work on segmentation data without any changes.
+**Visual validation:** the red dot lands exactly on the worm's centroid in frame 0.
 
-OCTRON datasets skip the `contours` variable entirely since OCTRON already
-exports centroid + bbox as CSV. The OCTRON loader is essentially the bboxes
-loader with a different file parser — the hard schema problem only applies to
-SAM2/YOLO where centroids and bboxes have to be derived from raw boolean masks.
+![Visual validation — frame 0](docs/visual_validation_frame0.png)
 
-## Memory Analysis (1000 frames, 3 individuals, 480×640)
+---
+
+## Key findings from testing
+
+These are things I discovered by actually running the code on the real data,
+which informed the loader design:
+
+1. **fps is nested** — it lives at `meta["video_info"]["fps_original"]`, not at the top level.
+   The loader reads this automatically so users don't need to supply it.
+
+2. **CSVs have 7 metadata header lines** before the actual column headers.
+   A plain `pd.read_csv()` call fails. The loader detects the real header row
+   by scanning for the `pos_x` and `track_id` columns.
+
+3. **`predictions.zarr` is zarr v3** — `xr.open_zarr()` fails with a
+   `dimension_names` error. The loader uses `zarr.open()` directly for
+   on-demand mask access.
+
+4. **OCTRON tracks multiple classes per video** — the same run produces
+   `worm_track_*.csv` and `led_track_*.csv`. The loader takes a `label`
+   parameter to select which class to load (e.g. `label="worm"`).
+
+5. **`Literal['OCTRON']` must be added** to the `source_software` annotation
+   in `movement/io/load.py` when the loader is merged into movement.
+
+---
+
+## Dataset schema
 
 ```
-Option A — full binary masks
-  shape: (1000, 3, 480, 640)
-  memory: 921.6 MB
-  at 30fps, 10-min video: ~16,589 MB
-  verdict: impractical for any real experiment
-
-Option B — RLE (estimated)
-  ~300 bytes per mask
-  memory: 0.90 MB  (1024x compression)
-  problem: variable-length, can't slice or index without decoding
-
-Option C — contour points (NaN-padded to 500 pts)
-  shape: (1000, 3, 500, 2)
-  memory: 12.0 MB  (76.8x compression)
-  fits xarray natively, NaN=no point (same convention movement uses
-  for missing pose keypoints)
-
-Hybrid proposal
-  OCTRON dataset (position + shape + confidence only): 0.1 MB
-  SAM2/YOLO dataset (+ contours):                    12.1 MB
-  RLE stored in ds.attrs for reconstruction if needed — not default path
+xr.Dataset (ds_type="masks")
+├── position      (time, space, individuals)   float32  ← centroid x,y
+├── shape         (time, space, individuals)   float32  ← bbox width, height
+├── confidence    (time, individuals)          float32
+├── area          (time, individuals)          float32  ← mask area in px
+├── eccentricity  (time, individuals)          float32  ← body elongation
+├── solidity      (time, individuals)          float32  ← curvature/curling
+├── orientation   (time, individuals)          float32  ← body angle (rad)
+└── attrs:
+    ├── source_software: "OCTRON"
+    ├── fps: 7.0
+    ├── mask_store: "path/to/predictions.zarr"  ← lazy reference
+    └── label: "worm"
 ```
 
-## Compatibility Proof
+Eccentricity ranges from 0 (circle) to 1 (line). For this worm:
+mean=0.932, min=0.879, max=0.971 — it captures elongation changes
+during locomotion, which is biologically meaningful.
+
+The `mask_store` attribute points to the existing zarr store.
+To access a single frame's mask on demand:
 
 ```python
-from movement.kinematics import compute_velocity, compute_path_length
-from movement.filtering import filter_by_confidence
-
-compute_velocity(ds['position'])                              # ✓
-filter_by_confidence(ds['position'], ds['confidence'], 0.8)  # ✓
-compute_path_length(ds['position'])                           # ✓
-ds['position'].sel(individuals='id_1')                        # ✓
-ds.sel(time=slice(0, 4))                                      # ✓
+import zarr
+store = zarr.open(ds.attrs["mask_store"], mode="r")
+mask = store["1_masks"][frame_idx]  # loads only that frame
 ```
 
-All pass. Same dims as the bboxes dataset — no changes to existing functions needed.
+---
 
-## Key Technical Decisions
+## Files
 
-**OCTRON first, SAM2 second.** OCTRON's output is already centroid + bbox CSVs
-(confirmed from docs and Zulip Feb 13). The OCTRON loader reuses existing bbox
-infrastructure with minimal changes. SAM2/YOLO loaders are the harder problem
-— they require computing centroids and bboxes from raw boolean masks, plus
-optional contour extraction via opencv. OCTRON also added SAM3 and YOLO26
-support in March 2026, meaning an OCTRON loader transitively supports
-SAM3-generated tracking results.
+```
+notes/
+├── utils.py               shared loader — read_octron_csv + build_octron_dataset
+├── octron_tests_v2.py     full test suite (A–J), run this first
+├── validate_api.py        mathematical proof — dummy CSV with known positions
+├── validate_kinematics.py speed sanity check (max 162 px/s, mean 22 px/s)
+├── validate_edge_cases.py error handling — wrong label, missing metadata
+└── validate_visually.py   generates the screenshot above
 
-**HuggingFace `transformers` for SAM2/3, not the raw Facebook repo.** sfmig
-recommended this on Zulip (Feb 13). It removes the `segment-anything-2`
-install dependency and makes SAM3 migration straightforward.
+docs/
+└── visual_validation_frame0.png
+```
 
-**Contours optional.** The `contours` variable is only added when the source
-format provides raw masks to extract from. OCTRON datasets won't have it.
-This keeps the schema clean and the OCTRON loader simple.
+---
 
-## Relates to
-[neuroinformatics-unit/movement#301](https://github.com/neuroinformatics-unit/movement/issues/301)
+## How to run
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+pip install -e "path/to/movement[dev]"
+
+# 2. Download Horst's sample data and place the octron_predictions/ folder in the repo root
+
+# 3. Run the test suite
+python notes/octron_tests_v2.py
+
+# 4. Run individual validations
+python notes/validate_api.py
+python notes/validate_kinematics.py
+python notes/validate_edge_cases.py
+```
+
+---
+
+## Requirements
+
+```
+movement (installed from source)
+numpy
+pandas
+xarray
+zarr
+opencv-python
+matplotlib
+```
+
+---
+
+*This repo is part of my GSoC 2026 application for the NIU movement project.*
+*GitHub: [Roaa-838](https://github.com/Roaa-838)*

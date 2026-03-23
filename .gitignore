@@ -1,4 +1,54 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Large data files — never commit these
+octron_predictions/
+*.mp4
+*.avi
+*.mov
+*.zarr/
+*.zarr
+
+# Temp test directories created by validate_edge_cases.py / validate_api.py
+temp_test/
+temp_test_2/
+temp_test*/
+
+# SAM2 model weights and cache
+sam2/
+*.pt
+*.pth
+*.ckpt
+
+
+# Secrets / env
+.env
+*.key
