@@ -46,7 +46,6 @@ if __name__ == "__main__":
     VIDEO_PATH = BASE_DIR / "worm_detailed.mp4"
     
     print("Building dataset...")
-    dataset = build_octron_dataset(FOLDER, "worm")
-    
+    dataset = build_octron_dataset(FOLDER / "prediction_metadata.json", "worm")
     print("Running visual validation...")
     validate_visually(VIDEO_PATH, dataset, frame_idx=0)

@@ -30,6 +30,6 @@ if __name__ == "__main__":
     folder_path = Path("octron_predictions/worm_detailed_BotSort")
     
     print("Loading dataset...")
-    dataset = build_octron_dataset(folder_path, "worm")
-    
+    dataset = build_octron_dataset(folder_path / "prediction_metadata.json", "worm")
+
     validate_kinematics(dataset)

@@ -38,9 +38,7 @@ which informed the loader design:
 1. **fps is nested** — it lives at `meta["video_info"]["fps_original"]`, not at the top level.
    The loader reads this automatically so users don't need to supply it.
 
-2. **CSVs have 7 metadata header lines** before the actual column headers.
-   A plain `pd.read_csv()` call fails. The loader detects the real header row
-   by scanning for the `pos_x` and `track_id` columns.
+2. **movement requires file-based entry points.** Because the GUI file picker and the backend router rely on file suffixes, passing an OCTRON folder fails. The loader strictly uses prediction_metadata.json as the file-based entry point to instantiate YOLO_results.
 
 3. **`predictions.zarr` is zarr v3** — `xr.open_zarr()` fails with a
    `dimension_names` error. The loader uses `zarr.open()` directly for
@@ -58,7 +56,7 @@ which informed the loader design:
 ## Dataset schema
 
 ```
-xr.Dataset (ds_type="masks")
+xr.Dataset (ds_type="bboxes")
 ├── position      (time, space, individuals)   float32  ← centroid x,y
 ├── shape         (time, space, individuals)   float32  ← bbox width, height
 ├── confidence    (time, individuals)          float32

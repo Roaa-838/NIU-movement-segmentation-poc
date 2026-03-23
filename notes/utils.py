@@ -1,111 +1,135 @@
 """
 notes/utils.py
 
-Shared loader utilities used by all validation and test scripts.
+Shared loader using the official OCTRON YOLO_results API.
 
-Two public functions:
-  read_octron_csv()      — reads a single OCTRON track CSV, skipping the
-                           variable-length metadata header.
-  build_octron_dataset() — builds a movement-compatible xr.Dataset from
-                           all per-class CSVs in an OCTRON prediction folder.
+Horst (OCTRON developer) recommended using YOLO_results instead of
+reading CSVs manually — it handles header-skipping, frame alignment,
+and feature extraction correctly.
+
+Key API facts confirmed from OCTRON source (yolo_results.py):
+  - YOLO_results() takes a folder path, NOT the JSON file path
+  - get_tracking_data() returns:
+      {track_id: {'label': str, 'data': df_pos, 'features': df_feat}}
+  - df_pos columns:  ['track_id', 'frame_idx', 'pos_y', 'pos_x']
+  - df_feat columns: ['frame_idx', 'confidence', 'bbox_x_min',
+                      'bbox_x_max', 'bbox_y_min', 'bbox_y_max',
+                      'bbox_area', 'bbox_aspect_ratio',
+                      ...plus dynamic feature cols: area, eccentricity,
+                      solidity, orientation, etc.]
+  - For movement integration, we accept prediction_metadata.json as the
+    file-based entry point (required by movement's ValidFile/GUI constraints),
+    then derive the folder from Path(json_path).parent.
 """
 
 import json
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import xarray as xr
+from octron import YOLO_results
 
 
-def read_octron_csv(filepath: Path, debug: bool = False) -> pd.DataFrame:
+def build_octron_dataset(file_path: Path, label_filter: str = "worm") -> xr.Dataset:
 
-    with open(filepath, "r") as f:
-        lines = f.readlines()
-
-    header_idx = None
-    for i, line in enumerate(lines):
-        if "pos_x" in line and "track_id" in line:
-            header_idx = i
-            break
-
-    if header_idx is None:
-        raise ValueError(f"Could not find header row in {filepath}")
-
-    if header_idx > 0 and debug:
-        print(f"  Skipped {header_idx} metadata lines in {filepath.name}")
-
-    return pd.read_csv(filepath, skiprows=header_idx)
-
-
-def build_octron_dataset(folder: Path, label_filter: str = "worm") -> xr.Dataset:
-
-    pattern = f"{label_filter}_track_*.csv"
-    csv_files = sorted(folder.glob(pattern))
-    if not csv_files:
+    file_path = Path(file_path)
+    if not file_path.exists():
         raise FileNotFoundError(
-            f"No CSV files for label='{label_filter}' found in {folder}"
+            f"Entry point not found: {file_path}\n"
+            "Pass the path to prediction_metadata.json inside the OCTRON "
+            "prediction subfolder."
         )
-
-    dfs = [read_octron_csv(f) for f in csv_files]
-
-    # Detect which column holds the frame number — OCTRON has used both names.
-    frame_col = next(
-        (c for c in ["frame_idx", "frame_counter", "frame"] if c in dfs[0].columns),
-        None,
-    )
-    if not frame_col:
+    if file_path.is_dir():
         raise ValueError(
-            "Could not find a valid frame column (e.g. 'frame_idx') in the CSV."
+            f"Expected a file (prediction_metadata.json), got a directory: {file_path}\n"
+            "Pass the JSON file path, not the folder."
         )
 
-    # Union of all frame numbers across individuals, sorted.
-    all_frames = sorted(set().union(*[set(df[frame_col].astype(int)) for df in dfs]))
+    # YOLO_results expects the folder, not the JSON file.
+    folder = file_path.parent
+    yolo = YOLO_results(str(folder), verbose=False)
+
+    # Filter track IDs to those matching label_filter.
+    track_ids = [
+        tid
+        for tid, label in yolo.track_id_label.items()
+        if label == label_filter
+    ]
+    if not track_ids:
+        available = list(set(yolo.track_id_label.values()))
+        raise FileNotFoundError(
+            f"No tracks found for label='{label_filter}' in {folder}.\n"
+            f"Available labels: {available}"
+        )
+    
+    tracking = yolo.get_tracking_data(interpolate=False)
+
+    matched = {tid: tracking[tid] for tid in track_ids if tid in tracking}
+    if not matched:
+        raise FileNotFoundError(
+            f"label='{label_filter}' found in metadata but no tracking data "
+            f"could be loaded from {folder}."
+        )
+
+    # Union of all frame indices across all matched tracks.
+    all_frames = sorted(
+        set().union(*[
+            set(v["data"]["frame_idx"].astype(int))
+            for v in matched.values()
+        ])
+    )
     n_frames = len(all_frames)
-    n_ind = len(dfs)
+    n_ind    = len(matched)
     frame_map = {f: i for i, f in enumerate(all_frames)}
 
-    # Pre-allocate with NaN so missing detections follow movement's convention.
-    pos  = np.full((n_frames, 2, n_ind), np.nan, "float32")
-    shp  = np.full((n_frames, 2, n_ind), np.nan, "float32")
-    conf = np.full((n_frames, n_ind),    np.nan, "float32")
-    area = np.full((n_frames, n_ind),    np.nan, "float32")
-    ecc  = np.full((n_frames, n_ind),    np.nan, "float32")
-    sol  = np.full((n_frames, n_ind),    np.nan, "float32")
-    ori  = np.full((n_frames, n_ind),    np.nan, "float32")
+    # Pre-allocate with NaN — missing detections follow movement's convention.
+    pos  = np.full((n_frames, 2, n_ind), np.nan, dtype="float32")
+    shp  = np.full((n_frames, 2, n_ind), np.nan, dtype="float32")
+    conf = np.full((n_frames, n_ind),    np.nan, dtype="float32")
+    area = np.full((n_frames, n_ind),    np.nan, dtype="float32")
+    ecc  = np.full((n_frames, n_ind),    np.nan, dtype="float32")
+    sol  = np.full((n_frames, n_ind),    np.nan, dtype="float32")
+    ori  = np.full((n_frames, n_ind),    np.nan, dtype="float32")
 
-    has_minmax = "bbox_x_min" in dfs[0].columns
+    individual_names = []
 
-    # Vectorized array population (replaces .iterrows — ~100x faster at scale).
-    for ii, df in enumerate(dfs):
-        row_frames = df[frame_col].astype(int).values
-        idx = np.array([frame_map[f] for f in row_frames])
+    for ii, (tid, track) in enumerate(sorted(matched.items())):
+        # Name by label + track_id — unique even across multi-animal videos.
+        individual_names.append(f"{track['label']}_track_{tid}")
 
-        pos[idx, 0, ii] = df["pos_x"].values
-        pos[idx, 1, ii] = df["pos_y"].values
+        # df_pos confirmed columns from source: track_id, frame_idx, pos_y, pos_x
+        df_pos = track["data"]
+        frames = df_pos["frame_idx"].astype(int).values
+        idx    = np.array([frame_map[f] for f in frames])
 
-        if has_minmax:
-            shp[idx, 0, ii] = (df["bbox_x_max"] - df["bbox_x_min"]).values
-            shp[idx, 1, ii] = (df["bbox_y_max"] - df["bbox_y_min"]).values
+        pos[idx, 0, ii] = df_pos["pos_x"].values  # space[0] = x
+        pos[idx, 1, ii] = df_pos["pos_y"].values  # space[1] = y
+        df_feat     = track["features"]
+        feat_frames = df_feat["frame_idx"].astype(int).values
+        feat_idx    = np.array([frame_map[f] for f in feat_frames])
 
-        # Safe column checks — not all OCTRON modes export these.
-        if "confidence"   in df.columns: conf[idx, ii] = df["confidence"].values
-        if "area"         in df.columns: area[idx, ii] = df["area"].values
-        if "eccentricity" in df.columns: ecc[idx, ii]  = df["eccentricity"].values
-        if "solidity"     in df.columns: sol[idx, ii]  = df["solidity"].values
-        if "orientation"  in df.columns: ori[idx, ii]  = df["orientation"].values
+        if "bbox_x_min" in df_feat.columns and "bbox_x_max" in df_feat.columns:
+            shp[feat_idx, 0, ii] = (
+                df_feat["bbox_x_max"].values - df_feat["bbox_x_min"].values
+            )
+        if "bbox_y_min" in df_feat.columns and "bbox_y_max" in df_feat.columns:
+            shp[feat_idx, 1, ii] = (
+                df_feat["bbox_y_max"].values - df_feat["bbox_y_min"].values
+            )
 
-    # Read fps from metadata — users don't need to supply it manually.
-    meta_path = folder / "prediction_metadata.json"
-    fps_val = None
-    octron_version = "unknown"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            m = json.load(f)
-        fps_val = m.get("video_info", {}).get("fps_original")
-        octron_version = m.get("octron_version", "unknown")
+        # Optional columns — present in segmentation mode, absent in detection mode.
+        if "confidence"   in df_feat.columns: conf[feat_idx, ii] = df_feat["confidence"].values
+        if "area"         in df_feat.columns: area[feat_idx, ii] = df_feat["area"].values
+        if "eccentricity" in df_feat.columns: ecc[feat_idx, ii]  = df_feat["eccentricity"].values
+        if "solidity"     in df_feat.columns: sol[feat_idx, ii]  = df_feat["solidity"].values
+        if "orientation"  in df_feat.columns: ori[feat_idx, ii]  = df_feat["orientation"].values
 
-    # Time in seconds if fps is known, else raw frame numbers.
+    # fps from prediction_metadata.json — users don't need to supply it manually.
+    with open(file_path) as f:
+        m = json.load(f)
+    fps_val        = m.get("video_info", {}).get("fps_original")
+    octron_version = m.get("octron_version", "unknown")
+
     time_coords = (
         np.array(all_frames) / fps_val
         if fps_val
@@ -125,10 +149,11 @@ def build_octron_dataset(folder: Path, label_filter: str = "worm") -> xr.Dataset
         coords={
             "time":        time_coords,
             "space":       ["x", "y"],
-            "individuals": [f.stem for f in csv_files],
+            "individuals": individual_names,
         },
         attrs={
             "source_software": "OCTRON",
+            "ds_type":         "bboxes",
             "fps":             fps_val,
             "label":           label_filter,
             "octron_version":  octron_version,
